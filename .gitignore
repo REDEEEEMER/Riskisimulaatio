@@ -1,0 +1,33 @@
+# Secrets and local credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+credentials.json
+tokens.json
+
+# Local editor state
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build and verification output
+/bin/
+/dist/
+/build/
+/riskisimulaatio
+*.exe
+*.test
+*.out
+coverage.*
+*.prof
+*.log
+
+# OS metadata
+.DS_Store
+Thumbs.db
