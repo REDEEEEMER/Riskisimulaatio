@@ -1,0 +1,560 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Grid Trading Risk Simulator</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+      :root { --ink:#17202a; --muted:#64748b; --line:#d9e1ea; --panel:#fff; --page:#f5f7fa; --accent:#1769aa; --danger:#b42318; --good:#027a48; }
+      * { box-sizing:border-box; } body { margin:0; font:14px/1.45 system-ui,sans-serif; color:var(--ink); background:var(--page); }
+      header { padding:24px max(18px,calc((100vw - 1300px)/2)); background:#102a43; color:white; } h1 { margin:0; font-size:25px; } header p { margin:5px 0 0; color:#d9e8f5; }
+      main { max-width:1300px; margin:20px auto; padding:0 18px 28px; display:grid; grid-template-columns:330px minmax(0,1fr); gap:20px; align-items:start; }
+      .panel, .block { background:var(--panel); border:1px solid var(--line); border-radius:8px; box-shadow:0 1px 2px #00000008; }
+      .panel { padding:16px; } .block { padding:18px; margin-bottom:16px; } h2 { font-size:18px; margin:0 0 12px; } h3 { font-size:15px; margin:18px 0 8px; color:#334e68; }
+      label { display:block; font-weight:600; margin:10px 0 3px; } input { width:100%; padding:8px; border:1px solid #9fb3c8; border-radius:4px; font:inherit; } input[aria-invalid="true"] { border-color:var(--danger); }
+      .error { min-height:16px; color:var(--danger); font-size:12px; } .help, .note { color:var(--muted); font-size:12px; }
+      button { margin-top:14px; padding:9px 12px; border:0; border-radius:4px; background:var(--accent); color:white; font:inherit; font-weight:700; cursor:pointer; } button:disabled { opacity:.55; cursor:not-allowed; } button.secondary { background:#52667a; margin-left:6px; }
+      .stale, .warning { display:none; margin:0 0 12px; padding:9px; border-radius:4px; } .stale.show { display:block; background:#fff7d6; color:#7a5200; } .warning.show { display:block; background:#fff0ef; color:var(--danger); }
+      .metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; } .metric { padding:10px; background:#f8fafc; border-radius:5px; } .metric b { display:block; font-size:18px; margin-top:2px; } .metric.prominent { border-left:4px solid var(--danger); } .caption { font-size:12px; color:var(--muted); margin:5px 0 0; }
+      .comparison { display:grid; grid-template-columns:1fr 1fr; gap:14px; } .comparison div { padding:8px; background:#f8fafc; } .row { display:flex; justify-content:space-between; gap:8px; border-bottom:1px solid var(--line); padding:6px 0; } .row:last-child { border:0; }
+      canvas { max-height:300px; } details { max-width:1300px; margin:0 auto 28px; padding:0 18px; } details > div { background:white; border:1px solid var(--line); padding:12px 16px; border-radius:6px; margin-top:8px; }
+      @media (max-width:760px) { main { grid-template-columns:1fr; } .metrics,.comparison { grid-template-columns:1fr; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Grid Trading Risk Simulator</h1>
+      <p>Simple boundary-risk intuition in percentage points from the starting price.</p>
+    </header>
+    <main>
+      <aside class="panel">
+        <h2>Inputs</h2>
+        <h3>Model A — Static</h3>
+        <div id="modelAInputs"></div>
+        <h3>Shared PnL</h3>
+        <div id="sharedInputs"></div>
+        <h3>Model B — Monte Carlo</h3>
+        <div id="modelBInputs"></div>
+        <button id="run" type="button">Run Simulation</button
+        ><button id="reset" class="secondary" type="button">Reset to defaults</button>
+      </aside>
+      <section>
+        <p id="stale" class="stale">Parameters changed — refresh simulation.</p>
+        <section class="block">
+          <h2>Model A — One-Month Delta Risk</h2>
+          <div id="static" class="metrics"></div>
+          <p class="note">
+            PoTs are independent heuristics and need not sum to 100%. Delta is not volatility; it is
+            a market-derived reference for how plausible each boundary looked at setup.
+          </p>
+        </section>
+        <section class="block">
+          <h2>One-Month Checkpoint</h2>
+          <div id="checkpoint" class="comparison"></div>
+          <p class="caption">
+            The two columns are not the same quantity (independent touch heuristics vs. first-exit
+            outcomes) and are compared only as a sanity/calibration check.
+          </p>
+        </section>
+        <section class="block">
+          <h2>Monte Carlo — Grid Lifetime</h2>
+          <p id="warning" class="warning"></p>
+          <div id="simulation" class="metrics"></div>
+        </section>
+        <section class="block">
+          <h2>Final PnL Distribution</h2>
+          <p id="chartNotice" class="note"></p>
+          <canvas id="histogram" aria-label="Final PnL histogram"></canvas>
+        </section>
+      </section>
+    </main>
+    <details>
+      <summary>About the models</summary>
+      <div>
+        <p>
+          One step = one trading hour; 280 hours = one PoC month = the Delta's approximate horizon.
+        </p>
+        <p>
+          An hourly move is a net change; volatility sets its typical size, drift adds a small bias.
+          Up-and-down behaviour emerges across steps.
+        </p>
+        <p>
+          Grid trades are a statistical proxy for movement, not exchange orders; repeated movement
+          over the same region deliberately counts again.
+        </p>
+        <p>
+          The Delta PoT is a heuristic snapshot from setup. The Monte Carlo grid runs past one month
+          until a boundary is touched.
+        </p>
+        <p>
+          Delta PoT and MC first-hit rates measure different things; compare them only as a sanity
+          check.
+        </p>
+      </div>
+    </details>
+    <script>
+      const CONSTANTS = {
+        NUM_PATHS: 5000,
+        HOURS_PER_DAY: 14,
+        DAYS_PER_WEEK: 5,
+        WEEKS_PER_MONTH: 4,
+        MONTH_HOURS: 280,
+        SAFETY_MAX_HOURS: 20000,
+        NUM_BINS: 45,
+        EPS: 1e-9,
+      };
+      const DEFAULTS = {
+        topDelta: 0.15,
+        bottomDelta: 0.25,
+        topPnl: 500,
+        bottomPnl: -2000,
+        gridProfit: 10,
+        topDist: 10,
+        bottomDist: 15,
+        gridSpacing: 1,
+        hourlyVol: 1.2,
+        hourlyDrift: 0.03,
+        seed: "",
+      };
+      const fields = [
+        ["topDelta", "Top Delta", "Model A"],
+        ["bottomDelta", "Bottom Delta", "Model A"],
+        ["topPnl", "Top Touch PnL", "Shared"],
+        ["bottomPnl", "Bottom Touch PnL", "Shared"],
+        ["gridProfit", "Profit per Grid Trade", "Shared"],
+        ["topDist", "Top Boundary Distance", "Model B"],
+        ["bottomDist", "Bottom Boundary Distance", "Model B"],
+        ["gridSpacing", "Grid Spacing", "Model B"],
+        ["hourlyVol", "Hourly Volatility", "Model B"],
+        ["hourlyDrift", "Hourly Drift", "Model B"],
+        ["seed", "Random Seed", "Model B"],
+      ];
+      function computeStatic(params) {
+        const topPoT = Math.min(1, 2 * Math.abs(params.topDelta));
+        const bottomPoT = Math.min(1, 2 * Math.abs(params.bottomDelta));
+        const boundaryEV = topPoT * params.topPnl + bottomPoT * params.bottomPnl;
+        return {
+          topPoT,
+          bottomPoT,
+          boundaryEV,
+          evBreakEvenTrades: Math.ceil(Math.max(0, -boundaryEV) / params.gridProfit),
+          bottomBreakEvenTrades: Math.ceil(Math.max(0, -params.bottomPnl) / params.gridProfit),
+        };
+      }
+      function createRng(seed) {
+        let state = seed >>> 0;
+        let spareNormal = null;
+        const random = () => {
+          state = (state + 0x6d2b79f5) >>> 0;
+          let value = state;
+          value = Math.imul(value ^ (value >>> 15), value | 1);
+          value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+          return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+        };
+        return {
+          seed: seed >>> 0,
+          random,
+          normal() {
+            if (spareNormal !== null) {
+              const result = spareNormal;
+              spareNormal = null;
+              return result;
+            }
+            const uniformA = Math.max(random(), Number.MIN_VALUE);
+            const uniformB = random();
+            const radius = Math.sqrt(-2 * Math.log(uniformA));
+            const angle = 2 * Math.PI * uniformB;
+            spareNormal = radius * Math.sin(angle);
+            return radius * Math.cos(angle);
+          },
+        };
+      }
+      function simulatePath(params, rng) {
+        let price = 0,
+          hours = 0,
+          trades = 0,
+          outcome = null;
+        const top = params.topDist,
+          bottom = -params.bottomDist;
+        if (params.hourlyVol === 0 && params.hourlyDrift === 0)
+          return {
+            outcome: "SAFETY_LIMIT",
+            hours: CONSTANTS.SAFETY_MAX_HOURS,
+            trades: 0,
+            gridPnl: 0,
+            finalPnl: null,
+          };
+        while (true) {
+          hours++;
+          const move = params.hourlyDrift + params.hourlyVol * rng.normal();
+          const proposed = price + move;
+          let distance;
+          if (proposed >= top - CONSTANTS.EPS) {
+            distance = top - price;
+            outcome = "TOP";
+          } else if (proposed <= bottom + CONSTANTS.EPS) {
+            distance = price - bottom;
+            outcome = "BOTTOM";
+          } else distance = Math.abs(move);
+          const exactTrades = distance / params.gridSpacing;
+          const baseTrades = Math.floor(exactTrades + CONSTANTS.EPS);
+          trades += baseTrades + (rng.random() < exactTrades - baseTrades ? 1 : 0);
+          if (outcome) break;
+          price = proposed;
+          if (hours >= CONSTANTS.SAFETY_MAX_HOURS) {
+            outcome = "SAFETY_LIMIT";
+            break;
+          }
+        }
+        const gridPnl = trades * params.gridProfit;
+        return {
+          outcome,
+          hours,
+          trades,
+          gridPnl,
+          finalPnl:
+            outcome === "TOP"
+              ? gridPnl + params.topPnl
+              : outcome === "BOTTOM"
+                ? gridPnl + params.bottomPnl
+                : null,
+        };
+      }
+      function median(values) {
+        const count = values.length;
+        if (!count) return null;
+        const middle = Math.floor(count / 2);
+        return count % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2;
+      }
+      function runSimulation(params, rng) {
+        const paths = Array.from({ length: CONSTANTS.NUM_PATHS }, () => simulatePath(params, rng));
+        const completed = paths.filter((path) => path.outcome !== "SAFETY_LIMIT");
+        const topExits = paths.filter((path) => path.outcome === "TOP");
+        const bottomExits = paths.filter((path) => path.outcome === "BOTTOM");
+        const safetyPaths = paths.filter((path) => path.outcome === "SAFETY_LIMIT");
+        const pnls = completed.map((path) => path.finalPnl).sort((left, right) => left - right);
+        const hours = completed.map((path) => path.hours).sort((left, right) => left - right);
+        const mean = (values) =>
+          values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+        const percentile = (probability) =>
+          pnls.length ? pnls[Math.floor(probability * (pnls.length - 1))] : null;
+        const pnlFor = (outcome) =>
+          completed.filter((path) => path.outcome === outcome).map((path) => path.finalPnl);
+        const topMonth =
+          topExits.filter((path) => path.hours <= CONSTANTS.MONTH_HOURS).length / paths.length;
+        const bottomMonth =
+          bottomExits.filter((path) => path.hours <= CONSTANTS.MONTH_HOURS).length / paths.length;
+        return {
+          seed: rng.seed,
+          paths,
+          stats: {
+            topRate: topExits.length / paths.length,
+            bottomRate: bottomExits.length / paths.length,
+            safetyRate: safetyPaths.length / paths.length,
+            meanPnl: mean(pnls),
+            medianPnl: median(pnls),
+            p5: percentile(0.05),
+            p95: percentile(0.95),
+            lossRate: completed.length
+              ? completed.filter((path) => path.finalPnl < 0).length / completed.length
+              : null,
+            topMean: mean(pnlFor("TOP")),
+            bottomMean: mean(pnlFor("BOTTOM")),
+            avgTrades: mean(completed.map((path) => path.trades)),
+            meanHours: mean(hours),
+            medianHours: median(hours),
+            topMonth,
+            bottomMonth,
+            noMonth: 1 - topMonth - bottomMonth,
+            completed: completed.length,
+            avgSafetyGridPnl: mean(safetyPaths.map((path) => path.gridPnl)),
+          },
+        };
+      }
+      function makeHistogram(values, numBins) {
+        if (!values.length) return { edges: [], counts: [] };
+        const minimum = Math.min(...values),
+          maximum = Math.max(...values);
+        if (maximum === minimum) return { edges: [minimum, maximum], counts: [values.length] };
+        const width = (maximum - minimum) / numBins;
+        const start = Math.floor(minimum / width),
+          end = Math.ceil(maximum / width);
+        const edges = Array.from(
+          { length: end - start + 1 },
+          (_, index) => (start + index) * width,
+        );
+        const counts = Array(edges.length - 1).fill(0);
+        values.forEach((value) => {
+          let index = Math.floor((value - edges[0]) / width);
+          if (index >= counts.length) index = counts.length - 1;
+          counts[index]++;
+        });
+        return { edges, counts };
+      }
+      const groups = {
+        "Model A": "modelAInputs",
+        Shared: "sharedInputs",
+        "Model B": "modelBInputs",
+      };
+      let chart = null,
+        hasRun = false,
+        stale = false;
+      function buildInputs() {
+        fields.forEach(([key, label, group]) => {
+          const wrap = document.createElement("div");
+          wrap.innerHTML = `<label for="${key}">${label}</label><input id="${key}" inputmode="decimal" value="${DEFAULTS[key]}" aria-describedby="${key}Error"><div class="error" id="${key}Error"></div>`;
+          document.getElementById(groups[group]).append(wrap);
+        });
+      }
+      function parseValue(key) {
+        const raw = document.getElementById(key).value.trim();
+        if (key === "seed") return raw === "" ? "" : Number(raw);
+        return raw === "" ? Number.NaN : Number(raw.replace(",", "."));
+      }
+      function readParams() {
+        const p = {};
+        fields.forEach(([key]) => (p[key] = parseValue(key)));
+        return p;
+      }
+      function validate(p) {
+        const errors = {};
+        const finite = (k) => Number.isFinite(p[k]);
+        ["topDelta", "bottomDelta"].forEach((k) => {
+          if (!finite(k) || Math.abs(p[k]) > 0.5) errors[k] = "Enter a value from -0.5 to 0.5.";
+        });
+        ["topPnl", "bottomPnl", "hourlyDrift"].forEach((k) => {
+          if (!finite(k)) errors[k] = "Enter a finite number.";
+        });
+        ["gridProfit", "topDist", "bottomDist", "gridSpacing"].forEach((k) => {
+          if (!finite(k) || p[k] <= 0) errors[k] = "Enter a number greater than 0.";
+        });
+        if (!finite("hourlyVol") || p.hourlyVol < 0)
+          errors.hourlyVol = "Enter a number of 0 or more.";
+        if (p.seed !== "" && (!Number.isInteger(p.seed) || !Number.isFinite(p.seed)))
+          errors.seed = "Enter an integer or leave blank.";
+        fields.forEach(([k]) => {
+          const input = document.getElementById(k),
+            err = document.getElementById(k + "Error");
+          input.setAttribute("aria-invalid", !!errors[k]);
+          err.textContent = errors[k] || "";
+        });
+        document.getElementById("run").disabled = Object.keys(errors).length > 0;
+        return errors;
+      }
+      const fmt = {
+        pct: (v) => (v === null || v === undefined ? "–" : (v * 100).toFixed(1) + " %"),
+        pnl: (v) => (v === null || v === undefined ? "–" : v.toFixed(0)),
+        num: (v) => (v === null || v === undefined ? "–" : v.toFixed(0)),
+        time: (v) =>
+          v === null || v === undefined
+            ? "–"
+            : `${v.toFixed(0)} h / ${(v / 14).toFixed(1)} d / ${(v / 70).toFixed(1)} w`,
+      };
+      function metric(label, value, caption = "", prominent = false) {
+        return `<div class="metric ${prominent ? "prominent" : ""}"><span>${label}</span><b>${value}</b>${caption ? `<p class="caption">${caption}</p>` : ""}</div>`;
+      }
+      function renderStatic(r) {
+        document.getElementById("static").innerHTML = r
+          ? [
+              metric("Top PoT", fmt.pct(r.topPoT)),
+              metric("Bottom PoT", fmt.pct(r.bottomPoT)),
+              metric("Delta-Based Boundary EV", fmt.pnl(r.boundaryEV)),
+              metric("EV Break-Even Trades", fmt.num(r.evBreakEvenTrades)),
+              metric(
+                "Bottom-Loss Break-Even Trades",
+                fmt.num(r.bottomBreakEvenTrades),
+                "Grid trades needed before a bottom hit for that path to break even.",
+                true,
+              ),
+            ].join("")
+          : [
+              metric("Top PoT", "–"),
+              metric("Bottom PoT", "–"),
+              metric("Delta-Based Boundary EV", "–"),
+              metric("EV Break-Even Trades", "–"),
+              metric(
+                "Bottom-Loss Break-Even Trades",
+                "–",
+                "Grid trades needed before a bottom hit for that path to break even.",
+                true,
+              ),
+            ].join("");
+      }
+      function renderSimulation(r) {
+        const s = r.stats;
+        document.getElementById("warning").className =
+          "warning" + (s.safetyRate > 0 ? " show" : "");
+        document.getElementById("warning").textContent =
+          s.safetyRate > 0
+            ? `Warning: ${fmt.pct(s.safetyRate)} reached the technical safety limit and are excluded from PnL statistics and the histogram. Average retained grid PnL: ${fmt.pnl(s.avgSafetyGridPnl)}.`
+            : "";
+        document.getElementById("simulation").innerHTML = [
+          metric("Eventual Top Exit Rate", fmt.pct(s.topRate)),
+          metric("Eventual Bottom Exit Rate", fmt.pct(s.bottomRate)),
+          metric("Safety-Limit Rate", fmt.pct(s.safetyRate)),
+          metric("Mean Final PnL", fmt.pnl(s.meanPnl)),
+          metric("Median Final PnL", fmt.pnl(s.medianPnl)),
+          metric("P5 / P95 Final PnL", `${fmt.pnl(s.p5)} / ${fmt.pnl(s.p95)}`),
+          metric("Probability of Loss", fmt.pct(s.lossRate)),
+          metric("Mean PnL, Top Exits", fmt.pnl(s.topMean)),
+          metric("Mean PnL, Bottom Exits", fmt.pnl(s.bottomMean)),
+          metric("Avg Grid Trades per Completed Path", fmt.num(s.avgTrades)),
+          metric("Mean Hours to Boundary", fmt.time(s.meanHours)),
+          metric("Median Hours to Boundary", fmt.time(s.medianHours)),
+          metric("Completed Paths", fmt.num(s.completed)),
+          metric("Seed Used", String(r.seed)),
+        ].join("");
+        const staticResult = validStatic() ? computeStatic(readParams()) : null;
+        document.getElementById("checkpoint").innerHTML =
+          `<div><div class="row"><span>Delta approx. Top PoT</span><b>${staticResult ? fmt.pct(staticResult.topPoT) : "–"}</b></div><div class="row"><span>Delta approx. Bottom PoT</span><b>${staticResult ? fmt.pct(staticResult.bottomPoT) : "–"}</b></div></div><div><div class="row"><span>MC Top first-hit by 280 h</span><b>${fmt.pct(s.topMonth)}</b></div><div class="row"><span>MC Bottom first-hit by 280 h</span><b>${fmt.pct(s.bottomMonth)}</b></div><div class="row"><span>MC No boundary by 280 h</span><b>${fmt.pct(s.noMonth)}</b></div></div>`;
+      }
+      function renderHistogram(h) {
+        const notice = document.getElementById("chartNotice");
+        const canvas = document.getElementById("histogram");
+        if (!window.Chart) {
+          notice.textContent =
+            "Chart unavailable: Chart.js could not be loaded. Completed-path results remain available above.";
+          return;
+        }
+        notice.textContent = h.counts.length ? "" : "No completed paths to plot.";
+        if (chart) chart.destroy();
+        if (!h.counts.length) return;
+        chart = new Chart(canvas, {
+          type: "bar",
+          data: {
+            labels: h.counts.map(
+              (_, i) => `${h.edges[i].toFixed(2)} to ${h.edges[i + 1].toFixed(2)}`,
+            ),
+            datasets: [
+              {
+                label: "Completed paths",
+                data: h.counts,
+                backgroundColor: h.counts.map((_, i) =>
+                  h.edges[i + 1] <= 0 ? "#b42318" : "#1769aa",
+                ),
+              },
+            ],
+          },
+          options: {
+            animation: false,
+            plugins: { legend: { display: false } },
+            scales: {
+              x: {
+                title: { display: true, text: "Final PnL" },
+                ticks: { maxRotation: 70, minRotation: 45 },
+              },
+              y: { beginAtZero: true, title: { display: true, text: "Count" } },
+            },
+          },
+        });
+      }
+      function renderEmptySimulation() {
+        const labels = [
+          "Eventual Top Exit Rate",
+          "Eventual Bottom Exit Rate",
+          "Safety-Limit Rate",
+          "Mean Final PnL",
+          "Median Final PnL",
+          "P5 / P95 Final PnL",
+          "Probability of Loss",
+          "Mean PnL, Top Exits",
+          "Mean PnL, Bottom Exits",
+          "Avg Grid Trades per Completed Path",
+          "Mean Hours to Boundary",
+          "Median Hours to Boundary",
+          "Completed Paths",
+          "Seed Used",
+        ];
+        document.getElementById("simulation").innerHTML = labels
+          .map((label) => metric(label, "–"))
+          .join("");
+      }
+      function renderCheckpointStatic(staticResult) {
+        if (hasRun) return;
+        document.getElementById("checkpoint").innerHTML =
+          `<div><div class="row"><span>Delta approx. Top PoT</span><b>${staticResult ? fmt.pct(staticResult.topPoT) : "–"}</b></div><div class="row"><span>Delta approx. Bottom PoT</span><b>${staticResult ? fmt.pct(staticResult.bottomPoT) : "–"}</b></div></div><div><div class="row"><span>MC Top first-hit by 280 h</span><b>–</b></div><div class="row"><span>MC Bottom first-hit by 280 h</span><b>–</b></div><div class="row"><span>MC No boundary by 280 h</span><b>–</b></div></div>`;
+      }
+      function validStatic() {
+        const p = readParams(),
+          e = validate(p);
+        return !["topDelta", "bottomDelta", "topPnl", "bottomPnl", "gridProfit"].some((k) => e[k]);
+      }
+      function refresh() {
+        const p = readParams(),
+          errors = validate(p),
+          staticResult = !["topDelta", "bottomDelta", "topPnl", "bottomPnl", "gridProfit"].some(
+            (k) => errors[k],
+          )
+            ? computeStatic(p)
+            : null;
+        renderStatic(staticResult);
+        renderCheckpointStatic(staticResult);
+        return { p, errors };
+      }
+      function markStale(key) {
+        if (hasRun && key !== "topDelta" && key !== "bottomDelta") {
+          stale = true;
+          document.getElementById("stale").classList.add("show");
+        }
+      }
+      buildInputs();
+      fields.forEach(([key]) =>
+        document.getElementById(key).addEventListener("input", () => {
+          refresh();
+          markStale(key);
+        }),
+      );
+      document.getElementById("reset").addEventListener("click", () => {
+        fields.forEach(([k]) => (document.getElementById(k).value = DEFAULTS[k]));
+        hasRun = false;
+        stale = false;
+        document.getElementById("stale").classList.remove("show");
+        renderEmptySimulation();
+        document.getElementById("warning").className = "warning";
+        if (chart) {
+          chart.destroy();
+          chart = null;
+        }
+        renderHistogram({ edges: [], counts: [] });
+        refresh();
+        document.getElementById("run").textContent = "Run Simulation";
+      });
+      document.getElementById("run").addEventListener("click", () => {
+        const { p, errors } = refresh();
+        if (Object.keys(errors).length) return;
+        const button = document.getElementById("run");
+        button.disabled = true;
+        button.textContent = "Running…";
+        setTimeout(() => {
+          const seed = p.seed === "" ? (Math.random() * 4294967296) >>> 0 : p.seed >>> 0,
+            result = runSimulation(p, createRng(seed));
+          renderSimulation(result);
+          renderHistogram(
+            makeHistogram(
+              result.paths.filter((x) => x.finalPnl !== null).map((x) => x.finalPnl),
+              CONSTANTS.NUM_BINS,
+            ),
+          );
+          hasRun = true;
+          stale = false;
+          document.getElementById("stale").classList.remove("show");
+          button.disabled = false;
+          button.textContent = "Refresh Simulation";
+        }, 0);
+      });
+      renderEmptySimulation();
+      renderHistogram({ edges: [], counts: [] });
+      refresh();
+      window.GridSim = {
+        computeStatic,
+        createRng,
+        simulatePath,
+        runSimulation,
+        makeHistogram,
+        DEFAULTS,
+        CONSTANTS,
+      };
+    </script>
+  </body>
+</html>
