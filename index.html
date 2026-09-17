@@ -18,8 +18,9 @@
       .stale, .warning { display:none; margin:0 0 12px; padding:9px; border-radius:4px; } .stale.show { display:block; background:#fff7d6; color:#7a5200; } .warning.show { display:block; background:#fff0ef; color:var(--danger); }
       .metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; } .metric { padding:10px; background:#f8fafc; border-radius:5px; } .metric b { display:block; font-size:18px; margin-top:2px; } .metric.prominent { border-left:4px solid var(--danger); } .caption { font-size:12px; color:var(--muted); margin:5px 0 0; }
       .comparison { display:grid; grid-template-columns:1fr 1fr; gap:14px; } .comparison div { padding:8px; background:#f8fafc; } .row { display:flex; justify-content:space-between; gap:8px; border-bottom:1px solid var(--line); padding:6px 0; } .row:last-child { border:0; }
+      .visualization-layout { display:grid; grid-template-columns:minmax(0,1fr) 260px; gap:14px; align-items:start; } .visualization-charts { min-width:0; } .chart-frame { margin-bottom:14px; } .chart-frame:last-child { margin-bottom:0; } .chart-frame h3 { margin-top:0; } .summary { padding:8px 12px; background:#f8fafc; } .summary .row span { color:var(--muted); } .summary .row b { text-align:right; } #activityChart { max-height:170px; }
       canvas { max-height:300px; } details { max-width:1300px; margin:0 auto 28px; padding:0 18px; } details > div { background:white; border:1px solid var(--line); padding:12px 16px; border-radius:6px; margin-top:8px; }
-      @media (max-width:760px) { main { grid-template-columns:1fr; } .metrics,.comparison { grid-template-columns:1fr; } }
+      @media (max-width:760px) { main { grid-template-columns:1fr; } .metrics,.comparison,.visualization-layout { grid-template-columns:1fr; } }
     </style>
   </head>
   <body>
@@ -67,6 +68,23 @@
           <p id="chartNotice" class="note"></p>
           <canvas id="histogram" aria-label="Final PnL histogram"></canvas>
         </section>
+        <section class="block">
+          <h2>One Random Completed Path</h2>
+          <p id="visualizationNotice" class="note"></p>
+          <div id="visualizationLayout" class="visualization-layout" hidden>
+            <div id="visualizationCharts" class="visualization-charts">
+              <div class="chart-frame">
+                <h3>Price Index and Hourly Candles</h3>
+                <canvas id="priceChart" aria-label="Price Index with hourly candles"></canvas>
+              </div>
+              <div class="chart-frame">
+                <h3>Completed Grid Cycles per Hour</h3>
+                <canvas id="activityChart" aria-label="Completed grid cycles per hour"></canvas>
+              </div>
+            </div>
+            <div id="pathSummary" class="summary" aria-label="Selected path summary"></div>
+          </div>
+        </section>
       </section>
     </main>
     <details>
@@ -76,12 +94,17 @@
           One step = one trading hour; 280 hours = one PoC month = the Delta's approximate horizon.
         </p>
         <p>
+          Users supply annual implied volatility and annual drift in percentage points, automatically
+          converted to trading-hour values using 14 hours/day, 5 days/week, and 52 weeks/year.
+          Volatility is divided by the square root of annual trading hours; drift by annual trading hours.
           An hourly move is a net change; volatility sets its typical size, drift adds a small bias.
           Up-and-down behaviour emerges across steps.
         </p>
         <p>
-          Grid trades are a statistical proxy for movement, not exchange orders; repeated movement
-          over the same region deliberately counts again.
+          Completed grid trades are sampled independently of price movement from the observed
+          trade count and calendar duration. The defaults represent 30 completed buy/sell cycles
+          over 50 calendar days (500 trading hours), or 0.060 completed trades per trading hour.
+          Only the completed cycle (sell) earns Profit per Grid Trade; the buy fill is not counted again.
         </p>
         <p>
           The Delta PoT is a heuristic snapshot from setup. The Monte Carlo grid runs past one month
@@ -98,12 +121,17 @@
         NUM_PATHS: 5000,
         HOURS_PER_DAY: 14,
         DAYS_PER_WEEK: 5,
+        WEEKS_PER_YEAR: 52,
         WEEKS_PER_MONTH: 4,
         MONTH_HOURS: 280,
         SAFETY_MAX_HOURS: 20000,
         NUM_BINS: 45,
         EPS: 1e-9,
+        PRICE_INDEX_START: 100,
+        VISUALIZATION_SALT: 0xa5f15237,
       };
+      const tradingHoursPerYear =
+        CONSTANTS.HOURS_PER_DAY * CONSTANTS.DAYS_PER_WEEK * CONSTANTS.WEEKS_PER_YEAR;
       const DEFAULTS = {
         topDelta: 0.15,
         bottomDelta: 0.25,
@@ -112,9 +140,10 @@
         gridProfit: 10,
         topDist: 10,
         bottomDist: 15,
-        gridSpacing: 1,
-        hourlyVol: 1.2,
-        hourlyDrift: 0.03,
+        observedAvgTrades: 30,
+        observedCalendarDays: 50,
+        annualVol: 20,
+        annualDrift: 11,
         seed: "",
       };
       const fields = [
@@ -125,9 +154,10 @@
         ["gridProfit", "Profit per Grid Trade", "Shared"],
         ["topDist", "Top Boundary Distance", "Model B"],
         ["bottomDist", "Bottom Boundary Distance", "Model B"],
-        ["gridSpacing", "Grid Spacing", "Model B"],
-        ["hourlyVol", "Hourly Volatility", "Model B"],
-        ["hourlyDrift", "Hourly Drift", "Model B"],
+        ["observedAvgTrades", "Observed Avg Grid Trades", "Model B"],
+        ["observedCalendarDays", "Observed Avg Grid Duration (Calendar Days)", "Model B"],
+        ["annualVol", "Annual Implied Volatility (%)", "Model B"],
+        ["annualDrift", "Annual Drift (%)", "Model B"],
         ["seed", "Random Seed", "Model B"],
       ];
       function computeStatic(params) {
@@ -170,36 +200,59 @@
           },
         };
       }
-      function simulatePath(params, rng) {
+      function tradeCalibration(params) {
+        const referenceTradingHours =
+          params.observedCalendarDays / 7 * CONSTANTS.DAYS_PER_WEEK * CONSTANTS.HOURS_PER_DAY;
+        return {
+          referenceTradingHours,
+          tradeRatePerHour: params.observedAvgTrades / referenceTradingHours,
+        };
+      }
+      function simulatePath(
+        params,
+        rng,
+        tradeRng = createRng(rng.seed ^ 0x9e3779b9),
+        captureHistory = false,
+      ) {
+        const hourlyVol = params.annualVol / Math.sqrt(tradingHoursPerYear);
+        const hourlyDrift = params.annualDrift / tradingHoursPerYear;
+        const { tradeRatePerHour } = tradeCalibration(params);
+        const wholeTrades = Math.floor(tradeRatePerHour);
+        const fractionalTrade = tradeRatePerHour - wholeTrades;
         let price = 0,
           hours = 0,
           trades = 0,
           outcome = null;
+        const hourlyHistory = captureHistory
+          ? [{ hour: 0, displacement: 0, completedCycles: 0 }]
+          : null;
+        let terminalProposedDisplacement = null,
+          terminalCompletedCycles = null;
         const top = params.topDist,
           bottom = -params.bottomDist;
-        if (params.hourlyVol === 0 && params.hourlyDrift === 0)
-          return {
-            outcome: "SAFETY_LIMIT",
-            hours: CONSTANTS.SAFETY_MAX_HOURS,
-            trades: 0,
-            gridPnl: 0,
-            finalPnl: null,
-          };
         while (true) {
           hours++;
-          const move = params.hourlyDrift + params.hourlyVol * rng.normal();
+          const move = hourlyDrift + hourlyVol * rng.normal();
           const proposed = price + move;
-          let distance;
           if (proposed >= top - CONSTANTS.EPS) {
-            distance = top - price;
             outcome = "TOP";
           } else if (proposed <= bottom + CONSTANTS.EPS) {
-            distance = price - bottom;
             outcome = "BOTTOM";
-          } else distance = Math.abs(move);
-          const exactTrades = distance / params.gridSpacing;
-          const baseTrades = Math.floor(exactTrades + CONSTANTS.EPS);
-          trades += baseTrades + (rng.random() < exactTrades - baseTrades ? 1 : 0);
+          }
+          // Whole trades plus a Bernoulli remainder also support calibrated rates above one.
+          const completedCycles = wholeTrades + (tradeRng.random() < fractionalTrade ? 1 : 0);
+          trades += completedCycles;
+          if (captureHistory) {
+            hourlyHistory.push({
+              hour: hours,
+              displacement: proposed,
+              completedCycles,
+            });
+            if (outcome) {
+              terminalProposedDisplacement = proposed;
+              terminalCompletedCycles = completedCycles;
+            }
+          }
           if (outcome) break;
           price = proposed;
           if (hours >= CONSTANTS.SAFETY_MAX_HOURS) {
@@ -213,6 +266,9 @@
           hours,
           trades,
           gridPnl,
+          hourlyHistory,
+          terminalProposedDisplacement,
+          terminalCompletedCycles,
           finalPnl:
             outcome === "TOP"
               ? gridPnl + params.topPnl
@@ -228,7 +284,38 @@
         return count % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2;
       }
       function runSimulation(params, rng) {
-        const paths = Array.from({ length: CONSTANTS.NUM_PATHS }, () => simulatePath(params, rng));
+        // Trade sampling must never consume the price RNG or change boundary paths.
+        const tradeRng = createRng(rng.seed ^ 0x9e3779b9);
+        // Visualization selection has its own deterministic stream and cannot affect either model stream.
+        const visualizationRng = createRng(rng.seed ^ CONSTANTS.VISUALIZATION_SALT);
+        const paths = [];
+        let visualizationPath = null,
+          completedBoundaryPaths = 0;
+        for (let index = 0; index < CONSTANTS.NUM_PATHS; index++) {
+          const path = simulatePath(params, rng, tradeRng, true);
+          paths.push({
+            outcome: path.outcome,
+            hours: path.hours,
+            trades: path.trades,
+            gridPnl: path.gridPnl,
+            finalPnl: path.finalPnl,
+          });
+          if (path.outcome === "TOP" || path.outcome === "BOTTOM") {
+            completedBoundaryPaths++;
+            if (visualizationRng.random() < 1 / completedBoundaryPaths) {
+              visualizationPath = {
+                hourlyHistory: path.hourlyHistory,
+                terminalProposedDisplacement: path.terminalProposedDisplacement,
+                terminalCompletedCycles: path.terminalCompletedCycles,
+                boundaryReached: path.outcome,
+                duration: path.hours,
+                accumulatedGridProfit: path.gridPnl,
+                finalPnl: path.finalPnl,
+                sellCount: path.trades,
+              };
+            }
+          }
+        }
         const completed = paths.filter((path) => path.outcome !== "SAFETY_LIMIT");
         const topExits = paths.filter((path) => path.outcome === "TOP");
         const bottomExits = paths.filter((path) => path.outcome === "BOTTOM");
@@ -248,6 +335,7 @@
         return {
           seed: rng.seed,
           paths,
+          visualizationPath,
           stats: {
             topRate: topExits.length / paths.length,
             bottomRate: bottomExits.length / paths.length,
@@ -271,6 +359,35 @@
             avgSafetyGridPnl: mean(safetyPaths.map((path) => path.gridPnl)),
           },
         };
+      }
+      function buildHourlyCandles(path, params, startingIndex = CONSTANTS.PRICE_INDEX_START) {
+        if (!path || !Array.isArray(path.hourlyHistory)) return [];
+        const upperBoundary = startingIndex + params.topDist;
+        const lowerBoundary = startingIndex - params.bottomDist;
+        const boundaryCompleted = path.boundaryReached === "TOP" || path.boundaryReached === "BOTTOM";
+        const boundaryIndex = path.boundaryReached === "TOP" ? upperBoundary : lowerBoundary;
+        return path.hourlyHistory.map((point, index) => {
+          const open =
+            index === 0
+              ? startingIndex
+              : startingIndex + path.hourlyHistory[index - 1].displacement;
+          const proposedClose = startingIndex + point.displacement;
+          const isTerminal =
+            boundaryCompleted && point.hour === path.duration && index === path.hourlyHistory.length - 1;
+          const close = isTerminal ? boundaryIndex : proposedClose;
+          return {
+            hour: point.hour,
+            open,
+            close,
+            high: Math.max(open, close),
+            low: Math.min(open, close),
+            displayedMovementPercent: open === 0 ? null : ((close - open) / open) * 100,
+            completedCycles: point.completedCycles,
+            simulatedDisplacement: point.displacement,
+            proposedClose,
+            isClipped: isTerminal,
+          };
+        });
       }
       function makeHistogram(values, numBins) {
         if (!values.length) return { edges: [], counts: [] };
@@ -298,12 +415,21 @@
         "Model B": "modelBInputs",
       };
       let chart = null,
+        priceChart = null,
+        activityChart = null,
         hasRun = false,
         stale = false;
       function buildInputs() {
         fields.forEach(([key, label, group]) => {
           const wrap = document.createElement("div");
           wrap.innerHTML = `<label for="${key}">${label}</label><input id="${key}" inputmode="decimal" value="${DEFAULTS[key]}" aria-describedby="${key}Error"><div class="error" id="${key}Error"></div>`;
+          if (["annualVol", "annualDrift", "observedAvgTrades", "observedCalendarDays"].includes(key)) {
+            const help = document.createElement("div");
+            help.className = "help";
+            help.id = key + "Help";
+            wrap.append(help);
+            wrap.querySelector("input").setAttribute("aria-describedby", `${key}Error ${key}Help`);
+          }
           document.getElementById(groups[group]).append(wrap);
         });
       }
@@ -323,14 +449,23 @@
         ["topDelta", "bottomDelta"].forEach((k) => {
           if (!finite(k) || Math.abs(p[k]) > 0.5) errors[k] = "Enter a value from -0.5 to 0.5.";
         });
-        ["topPnl", "bottomPnl", "hourlyDrift"].forEach((k) => {
+        ["topPnl", "bottomPnl", "annualDrift"].forEach((k) => {
           if (!finite(k)) errors[k] = "Enter a finite number.";
         });
-        ["gridProfit", "topDist", "bottomDist", "gridSpacing"].forEach((k) => {
+        ["gridProfit", "topDist", "bottomDist", "observedCalendarDays"].forEach((k) => {
           if (!finite(k) || p[k] <= 0) errors[k] = "Enter a number greater than 0.";
         });
-        if (!finite("hourlyVol") || p.hourlyVol < 0)
-          errors.hourlyVol = "Enter a number of 0 or more.";
+        if (!finite("annualVol") || p.annualVol < 0)
+          errors.annualVol = "Enter a number of 0 or more.";
+        if (!finite("observedAvgTrades") || p.observedAvgTrades < 0)
+          errors.observedAvgTrades = "Enter a number of 0 or more.";
+        if (!errors.observedCalendarDays && !errors.observedAvgTrades) {
+          const calibration = tradeCalibration(p);
+          if (!Number.isFinite(calibration.referenceTradingHours) ||
+              !Number.isFinite(calibration.tradeRatePerHour) ||
+              calibration.tradeRatePerHour > Number.MAX_SAFE_INTEGER / CONSTANTS.SAFETY_MAX_HOURS)
+            errors.observedAvgTrades = "Enter a calibration within the supported numeric range.";
+        }
         if (p.seed !== "" && (!Number.isInteger(p.seed) || !Number.isFinite(p.seed)))
           errors.seed = "Enter an integer or leave blank.";
         fields.forEach(([k]) => {
@@ -351,6 +486,7 @@
             ? "–"
             : `${v.toFixed(0)} h / ${(v / 14).toFixed(1)} d / ${(v / 70).toFixed(1)} w`,
       };
+      fmt.index = (v) => (v === null || v === undefined ? "â€“" : v.toFixed(2));
       function metric(label, value, caption = "", prominent = false) {
         return `<div class="metric ${prominent ? "prominent" : ""}"><span>${label}</span><b>${value}</b>${caption ? `<p class="caption">${caption}</p>` : ""}</div>`;
       }
@@ -381,7 +517,7 @@
               ),
             ].join("");
       }
-      function renderSimulation(r) {
+      function renderSimulation(r, params) {
         const s = r.stats;
         document.getElementById("warning").className =
           "warning" + (s.safetyRate > 0 ? " show" : "");
@@ -408,6 +544,7 @@
         const staticResult = validStatic() ? computeStatic(readParams()) : null;
         document.getElementById("checkpoint").innerHTML =
           `<div><div class="row"><span>Delta approx. Top PoT</span><b>${staticResult ? fmt.pct(staticResult.topPoT) : "–"}</b></div><div class="row"><span>Delta approx. Bottom PoT</span><b>${staticResult ? fmt.pct(staticResult.bottomPoT) : "–"}</b></div></div><div><div class="row"><span>MC Top first-hit by 280 h</span><b>${fmt.pct(s.topMonth)}</b></div><div class="row"><span>MC Bottom first-hit by 280 h</span><b>${fmt.pct(s.bottomMonth)}</b></div><div class="row"><span>MC No boundary by 280 h</span><b>${fmt.pct(s.noMonth)}</b></div></div>`;
+        renderVisualization(r.visualizationPath, params);
       }
       function renderHistogram(h) {
         const notice = document.getElementById("chartNotice");
@@ -449,6 +586,218 @@
           },
         });
       }
+      function destroyVisualizationCharts() {
+        if (priceChart) {
+          priceChart.destroy();
+          priceChart = null;
+        }
+        if (activityChart) {
+          activityChart.destroy();
+          activityChart = null;
+        }
+      }
+      function createHourlyCandlePlugin(candles) {
+        return {
+          id: "hourlyCandles",
+          afterDatasetsDraw(currentChart) {
+            const { ctx, chartArea, scales } = currentChart;
+            const xScale = scales.x;
+            const yScale = scales.y;
+            const duration = candles.length > 1 ? candles[candles.length - 1].hour : 0;
+            const step = duration
+              ? Math.abs(xScale.getPixelForValue(1) - xScale.getPixelForValue(0))
+              : chartArea.width;
+            const bodyWidth = Math.max(1, Math.min(9, step * 0.65));
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(chartArea.left, chartArea.top, chartArea.width, chartArea.height);
+            ctx.clip();
+            candles.forEach((candle) => {
+              const x = xScale.getPixelForValue(candle.hour);
+              const high = yScale.getPixelForValue(candle.high);
+              const low = yScale.getPixelForValue(candle.low);
+              const open = yScale.getPixelForValue(candle.open);
+              const close = yScale.getPixelForValue(candle.close);
+              const rising = candle.close >= candle.open;
+              const color = rising ? "#027a48" : "#b42318";
+              const bodyTop = Math.min(open, close);
+              const bodyHeight = Math.max(1, Math.abs(close - open));
+              ctx.strokeStyle = color;
+              ctx.fillStyle = color;
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.moveTo(x, high);
+              ctx.lineTo(x, low);
+              ctx.stroke();
+              ctx.globalAlpha = 0.78;
+              ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
+              ctx.globalAlpha = 1;
+              ctx.strokeRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
+            });
+            ctx.restore();
+          },
+        };
+      }
+      function renderPathSummary(path, candles) {
+        const endingIndex = candles.length ? candles[candles.length - 1].close : null;
+        const boundaryLabel = path.boundaryReached === "TOP" ? "Upper" : "Lower";
+        document.getElementById("pathSummary").innerHTML = [
+          `<div class="row"><span>Accumulated Grid Profit</span><b>${fmt.pnl(path.accumulatedGridProfit)}</b></div>`,
+          `<div class="row"><span>Final PnL</span><b>${fmt.pnl(path.finalPnl)}</b></div>`,
+          `<div class="row"><span>Sell Count</span><b>${fmt.num(path.sellCount)}</b></div>`,
+          `<div class="row"><span>Grid Duration</span><b>${fmt.num(path.duration)} h</b></div>`,
+          `<div class="row"><span>Boundary Reached</span><b>${boundaryLabel}</b></div>`,
+          `<div class="row"><span>Starting Price Index</span><b>${fmt.index(CONSTANTS.PRICE_INDEX_START)}</b></div>`,
+          `<div class="row"><span>Ending Price Index</span><b>${fmt.index(endingIndex)}</b></div>`,
+        ].join("");
+      }
+      function renderVisualization(path, params) {
+        const notice = document.getElementById("visualizationNotice");
+        const layout = document.getElementById("visualizationLayout");
+        const charts = document.getElementById("visualizationCharts");
+        destroyVisualizationCharts();
+        if (!path) {
+          layout.hidden = true;
+          charts.style.display = "";
+          document.getElementById("pathSummary").innerHTML = "";
+          notice.textContent = "No completed boundary path is available for visualization.";
+          return;
+        }
+        const candles = buildHourlyCandles(path, params);
+        layout.hidden = false;
+        renderPathSummary(path, candles);
+        notice.textContent =
+          "Price Index starts at 100; hourly moves are not compounded. The final candle is clipped to the touched boundary for display only, and does not change the simulation result.";
+        if (!window.Chart) {
+          charts.style.display = "none";
+          notice.textContent += " Chart.js could not be loaded, so the selected path summary remains available.";
+          return;
+        }
+        charts.style.display = "";
+        const candleByHour = new Map(candles.map((candle) => [candle.hour, candle]));
+        const tooltipFor = (context) => {
+          const candle = candleByHour.get(Math.round(context.parsed.x));
+          if (!candle) return [];
+          const movement = candle.displayedMovementPercent === null
+            ? "N/A"
+            : `${candle.displayedMovementPercent.toFixed(4)} %`;
+          return [
+            `Open: ${fmt.index(candle.open)}`,
+            `Close: ${fmt.index(candle.close)}`,
+            `Displayed percentage movement: ${movement}`,
+            `Completed grid cycles: ${candle.completedCycles}`,
+          ];
+        };
+        const boundaryDatasets = [
+          {
+            label: "Upper boundary",
+            data: candles.map((candle) => ({ x: candle.hour, y: CONSTANTS.PRICE_INDEX_START + params.topDist })),
+            borderColor: "#b42318",
+            borderDash: [6, 4],
+            borderWidth: 1,
+            pointRadius: 0,
+            parsing: false,
+          },
+          {
+            label: "Lower boundary",
+            data: candles.map((candle) => ({ x: candle.hour, y: CONSTANTS.PRICE_INDEX_START - params.bottomDist })),
+            borderColor: "#b42318",
+            borderDash: [2, 4],
+            borderWidth: 1,
+            pointRadius: 0,
+            parsing: false,
+          },
+        ];
+        priceChart = new Chart(document.getElementById("priceChart"), {
+          type: "line",
+          data: {
+            datasets: [
+              {
+                label: "Price Index",
+                data: candles.map((candle) => ({ x: candle.hour, y: candle.close })),
+                borderColor: "#1769aa",
+                borderWidth: 1.5,
+                pointRadius: 0,
+                tension: 0,
+                parsing: false,
+              },
+              ...boundaryDatasets,
+            ],
+          },
+          plugins: [createHourlyCandlePlugin(candles)],
+          options: {
+            animation: false,
+            interaction: { mode: "index", intersect: false },
+            plugins: {
+              decimation: { enabled: false },
+              tooltip: {
+                filter: (item) => item.datasetIndex === 0,
+                callbacks: {
+                  title: (items) => items.length ? `Hour ${items[0].parsed.x}` : "",
+                  label: tooltipFor,
+                },
+              },
+            },
+            scales: {
+              x: {
+                type: "linear",
+                min: 0,
+                max: path.duration,
+                title: { display: true, text: "Elapsed simulation hours" },
+                ticks: { maxTicksLimit: 12, callback: (value) => `${value} h` },
+              },
+              y: { title: { display: true, text: "Price Index" } },
+            },
+          },
+        });
+        activityChart = new Chart(document.getElementById("activityChart"), {
+          type: "bar",
+          data: {
+            datasets: [{
+              label: "Completed grid cycles",
+              data: candles.map((candle) => ({ x: candle.hour, y: candle.completedCycles })),
+              backgroundColor: "#7aa7c7",
+              borderColor: "#1769aa",
+              borderWidth: 1,
+              parsing: false,
+              barPercentage: 1,
+              categoryPercentage: 1,
+            }],
+          },
+          options: {
+            animation: false,
+            interaction: { mode: "index", intersect: false },
+            plugins: {
+              decimation: { enabled: false },
+              tooltip: {
+                callbacks: {
+                  title: (items) => items.length ? `Hour ${items[0].parsed.x}` : "",
+                  label: (context) => `Completed grid cycles: ${context.parsed.y}`,
+                },
+              },
+              legend: { display: false },
+            },
+            scales: {
+              x: {
+                type: "linear",
+                min: 0,
+                max: path.duration,
+                title: { display: true, text: "Elapsed simulation hours" },
+                ticks: { maxTicksLimit: 12, callback: (value) => `${value} h` },
+              },
+              y: { beginAtZero: true, title: { display: true, text: "Completed grid cycles" } },
+            },
+          },
+        });
+      }
+      function renderEmptyVisualization() {
+        destroyVisualizationCharts();
+        document.getElementById("visualizationLayout").hidden = true;
+        document.getElementById("visualizationCharts").style.display = "";
+        document.getElementById("pathSummary").innerHTML = "";
+        document.getElementById("visualizationNotice").textContent =
+          "No completed boundary path is available for visualization.";
+      }
       function renderEmptySimulation() {
         const labels = [
           "Eventual Top Exit Rate",
@@ -488,6 +837,20 @@
           )
             ? computeStatic(p)
             : null;
+        document.getElementById("annualVolHelp").textContent =
+          "Equivalent hourly volatility: " +
+          (errors.annualVol ? "–" : (p.annualVol / Math.sqrt(tradingHoursPerYear)).toFixed(4) + "%");
+        document.getElementById("annualDriftHelp").textContent =
+          "Equivalent hourly drift: " +
+          (errors.annualDrift ? "–" : (p.annualDrift / tradingHoursPerYear).toFixed(5) + "%");
+        const calibration = tradeCalibration(p);
+        document.getElementById("observedAvgTradesHelp").textContent =
+          "Equivalent trade rate: " +
+          (errors.observedAvgTrades || errors.observedCalendarDays ? "–" :
+            calibration.tradeRatePerHour.toFixed(3) + " completed trades/trading hour");
+        document.getElementById("observedCalendarDaysHelp").textContent =
+          "Equivalent trading duration: " +
+          (errors.observedCalendarDays ? "–" : calibration.referenceTradingHours.toFixed(0) + " h");
         renderStatic(staticResult);
         renderCheckpointStatic(staticResult);
         return { p, errors };
@@ -511,6 +874,7 @@
         stale = false;
         document.getElementById("stale").classList.remove("show");
         renderEmptySimulation();
+        renderEmptyVisualization();
         document.getElementById("warning").className = "warning";
         if (chart) {
           chart.destroy();
@@ -529,7 +893,7 @@
         setTimeout(() => {
           const seed = p.seed === "" ? (Math.random() * 4294967296) >>> 0 : p.seed >>> 0,
             result = runSimulation(p, createRng(seed));
-          renderSimulation(result);
+          renderSimulation(result, p);
           renderHistogram(
             makeHistogram(
               result.paths.filter((x) => x.finalPnl !== null).map((x) => x.finalPnl),
@@ -544,13 +908,16 @@
         }, 0);
       });
       renderEmptySimulation();
+      renderEmptyVisualization();
       renderHistogram({ edges: [], counts: [] });
       refresh();
       window.GridSim = {
+        tradeCalibration,
         computeStatic,
         createRng,
         simulatePath,
         runSimulation,
+        buildHourlyCandles,
         makeHistogram,
         DEFAULTS,
         CONSTANTS,
