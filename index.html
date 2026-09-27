@@ -13,6 +13,7 @@
       .panel, .block { background:var(--panel); border:1px solid var(--line); border-radius:8px; box-shadow:0 1px 2px #00000008; }
       .panel { padding:16px; } .block { padding:18px; margin-bottom:16px; } h2 { font-size:18px; margin:0 0 12px; } h3 { font-size:15px; margin:18px 0 8px; color:#334e68; }
       label { display:block; font-weight:600; margin:10px 0 3px; } input { width:100%; padding:8px; border:1px solid #9fb3c8; border-radius:4px; font:inherit; } input[aria-invalid="true"] { border-color:var(--danger); }
+      select { width:100%; padding:8px; border:1px solid #9fb3c8; border-radius:4px; font:inherit; } [hidden] { display:none !important; }
       .error { min-height:16px; color:var(--danger); font-size:12px; } .help, .note { color:var(--muted); font-size:12px; }
       button { margin-top:14px; padding:9px 12px; border:0; border-radius:4px; background:var(--accent); color:white; font:inherit; font-weight:700; cursor:pointer; } button:disabled { opacity:.55; cursor:not-allowed; } button.secondary { background:#52667a; margin-left:6px; }
       .stale, .warning { display:none; margin:0 0 12px; padding:9px; border-radius:4px; } .stale.show { display:block; background:#fff7d6; color:#7a5200; } .warning.show { display:block; background:#fff0ef; color:var(--danger); }
@@ -37,6 +38,19 @@
         <div id="sharedInputs"></div>
         <h3>Model B — Monte Carlo</h3>
         <div id="modelBInputs"></div>
+        <h3>Grid B</h3>
+        <label><input id="enableGridB" type="checkbox" style="width:auto"> Enable second grid</label>
+        <div id="gridBSettings" hidden>
+          <label for="relationship">Underlying relationship</label>
+          <select id="relationship"><option value="same">Same underlying</option><option value="different">Different underlying</option></select>
+          <label for="startMode">Grid B start mode</label>
+          <select id="startMode"><option value="immediate">Start immediately</option><option value="trigger">Start when Grid A reaches trigger level</option></select>
+          <div id="triggerField"><label for="trigger">Grid A trigger index</label><input id="trigger" value="105"></div>
+          <div id="rhoField"><label for="rho">Hourly Price-Move Correlation (Pearson ρ)</label><input id="rho" value="0" type="number" min="-1" max="1" step="0.01"></div>
+          <p class="note">Boundaries are fixed index-point offsets from Grid B's activation price. Same underlying uses Grid A volatility and drift.</p>
+          <div id="gridBInputs"></div>
+          <p id="gridBError" class="error" role="alert"></p>
+        </div>
         <button id="run" type="button">Run Simulation</button
         ><button id="reset" class="secondary" type="button">Reset to defaults</button>
       </aside>
@@ -59,12 +73,14 @@
           </p>
         </section>
         <section class="block">
-          <h2>Monte Carlo — Grid Lifetime</h2>
+          <h2 id="gridLifetimeTitle">Monte Carlo — Grid Lifetime</h2>
           <p id="warning" class="warning"></p>
           <div id="simulation" class="metrics"></div>
+          <div id="dualResults" hidden></div>
         </section>
         <section class="block">
-          <h2>Final PnL Distribution</h2>
+          <h2 id="distributionTitle">Final PnL Distribution</h2>
+          <select id="distribution" aria-label="Final PnL distribution" hidden><option value="combined">Combined Final PnL</option><option value="a">Grid A Final PnL</option><option value="b">Grid B Final PnL</option></select>
           <p id="chartNotice" class="note"></p>
           <canvas id="histogram" aria-label="Final PnL histogram"></canvas>
         </section>
@@ -74,7 +90,7 @@
           <div id="visualizationLayout" class="visualization-layout" hidden>
             <div id="visualizationCharts" class="visualization-charts">
               <div class="chart-frame">
-                <h3>Price Index and Hourly Candles</h3>
+                <h3 id="priceChartTitle">Price Index and Hourly Candles</h3>
                 <canvas id="priceChart" aria-label="Price Index with hourly candles"></canvas>
               </div>
               <div class="chart-frame">
@@ -172,9 +188,9 @@
           bottomBreakEvenTrades: Math.ceil(Math.max(0, -params.bottomPnl) / params.gridProfit),
         };
       }
-      function createRng(seed) {
-        let state = seed >>> 0;
-        let spareNormal = null;
+      function createRng(seed, snapshot = null) {
+        let state = snapshot ? snapshot.state : seed >>> 0;
+        let spareNormal = snapshot ? snapshot.spareNormal : null;
         const random = () => {
           state = (state + 0x6d2b79f5) >>> 0;
           let value = state;
@@ -184,6 +200,7 @@
         };
         return {
           seed: seed >>> 0,
+          clone: () => createRng(seed, { state, spareNormal }),
           random,
           normal() {
             if (spareNormal !== null) {
@@ -289,10 +306,34 @@
         // Visualization selection has its own deterministic stream and cannot affect either model stream.
         const visualizationRng = createRng(rng.seed ^ CONSTANTS.VISUALIZATION_SALT);
         const paths = [];
+        const portfolios = [];
+        const portfolioSelection = createRng(rng.seed ^ 0x28ab190d);
+        let portfolioVisualization = null, portfolioCompleted = 0;
         let visualizationPath = null,
           completedBoundaryPaths = 0;
         for (let index = 0; index < CONSTANTS.NUM_PATHS; index++) {
-          const path = simulatePath(params, rng, tradeRng, true);
+          const shocks = [];
+          const priceRng = params.gridB?.enabled ? {
+            normal: () => {
+              const shock = rng.normal();
+              shocks.push(shock);
+              return shock;
+            },
+          } : rng;
+          const path = simulatePath(params, priceRng, tradeRng, true);
+          if (params.gridB?.enabled) {
+            const portfolio = simulateGridB(params, path, shocks,
+              createRng(rng.seed ^ Math.imul(index + 1, 0x85ebca6b)),
+              createRng(rng.seed ^ Math.imul(index + 1, 0xc2b2ae35)),
+              rng.clone());
+            if (portfolio.finalPnl !== null) {
+              portfolioCompleted++;
+              if (portfolioSelection.random() < 1 / portfolioCompleted)
+                portfolioVisualization = { ...portfolio, gridA: path };
+            }
+            const { hourlyHistory, ...summaryB } = portfolio.gridB;
+            portfolios.push({ ...portfolio, gridB: summaryB });
+          }
           paths.push({
             outcome: path.outcome,
             hours: path.hours,
@@ -333,6 +374,10 @@
         const bottomMonth =
           bottomExits.filter((path) => path.hours <= CONSTANTS.MONTH_HOURS).length / paths.length;
         return {
+          ...(params.gridB?.enabled ? { portfolios, portfolioVisualization,
+            gridBStats: summarizeDual(portfolios.filter(p => p.gridB.activationHour !== null).map(p => p.gridB)),
+            combinedStats: summarizeDual(portfolios),
+            activationRate: portfolios.filter(p => p.gridB.activationHour !== null).length / paths.length } : {}),
           seed: rng.seed,
           paths,
           visualizationPath,
@@ -359,6 +404,72 @@
             avgSafetyGridPnl: mean(safetyPaths.map((path) => path.gridPnl)),
           },
         };
+      }
+      // Replay A's moves, then continue a snapshot of its price RNG. Continuing the
+      // market must not advance the RNG that seeds the next Monte Carlo A path.
+      function simulateGridB(params, gridA, shocks, independentRng, tradeRng, continuationRng) {
+        const b = params.gridB;
+        const same = b.relationship === "same";
+        const market = same ? params : b;
+        const rate = tradeCalibration(b).tradeRatePerHour;
+        const gridB = { outcome: "PENDING", activationHour: null, startPrice: null,
+          hours: null, trades: 0, gridPnl: 0, finalPnl: null, hourlyHistory: [] };
+        const activate = (hour, price) => {
+          Object.assign(gridB, { outcome: "ACTIVE", activationHour: hour, startPrice: price, hours: 0,
+            upper: price + b.topDist, lower: price - b.bottomDist });
+          gridB.hourlyHistory.push({ hour, price, completedCycles: 0 });
+        };
+        if (b.startMode === "immediate" || b.trigger === 100) activate(0, 100);
+        let sharedPrice = 100, bPrice = 100, hour = 0;
+        for (hour = 1; hour <= CONSTANTS.SAFETY_MAX_HOURS; hour++) {
+          const zA = hour <= gridA.hours ? shocks[hour - 1] : continuationRng.normal();
+          const zB = same ? zA : b.rho * zA + Math.sqrt(1 - b.rho * b.rho) * independentRng.normal();
+          sharedPrice = hour <= gridA.hours ? 100 + gridA.hourlyHistory[hour].displacement
+            : sharedPrice + params.annualDrift / tradingHoursPerYear + params.annualVol / Math.sqrt(tradingHoursPerYear) * zA;
+          if (gridB.outcome === "ACTIVE") {
+            bPrice = same ? sharedPrice : bPrice + market.annualDrift / tradingHoursPerYear
+              + market.annualVol / Math.sqrt(tradingHoursPerYear) * zB;
+            gridB.hours++;
+            const cycles = Math.floor(rate) + (tradeRng.random() < rate % 1 ? 1 : 0);
+            gridB.trades += cycles;
+            if (bPrice >= gridB.upper - CONSTANTS.EPS) gridB.outcome = "TOP";
+            else if (bPrice <= gridB.lower + CONSTANTS.EPS) gridB.outcome = "BOTTOM";
+            gridB.hourlyHistory.push({ hour, price: bPrice, completedCycles: cycles });
+          } else if (gridB.outcome === "PENDING") {
+            // A's absorbing boundary limits trigger eligibility, but not the shared market endpoint.
+            const effective = Math.max(100 - params.bottomDist, Math.min(100 + params.topDist, sharedPrice));
+            if (b.trigger > 100 ? effective >= b.trigger : effective <= b.trigger) {
+              activate(hour, same ? sharedPrice : 100);
+              bPrice = gridB.startPrice;
+            } else if (hour === gridA.hours && gridA.outcome !== "SAFETY_LIMIT") {
+              gridB.outcome = "NOT_ACTIVATED";
+            }
+          }
+          if (hour >= gridA.hours && !["ACTIVE", "PENDING"].includes(gridB.outcome)) break;
+        }
+        hour = Math.min(hour, CONSTANTS.SAFETY_MAX_HOURS);
+        if (gridB.outcome === "ACTIVE") gridB.outcome = "SAFETY_LIMIT";
+        if (gridB.outcome === "PENDING") gridB.outcome = "NOT_ACTIVATED_SAFETY_LIMIT";
+        gridB.gridPnl = gridB.trades * b.gridProfit;
+        if (gridB.outcome === "TOP" || gridB.outcome === "BOTTOM")
+          gridB.finalPnl = gridB.gridPnl + (gridB.outcome === "TOP" ? b.topPnl : b.bottomPnl);
+        const safety = gridA.outcome === "SAFETY_LIMIT" || gridB.outcome.includes("SAFETY_LIMIT");
+        return { gridB, hours: hour, trades: gridA.trades + gridB.trades,
+          outcome: safety ? "SAFETY_LIMIT" : "COMPLETED",
+          finalPnl: safety ? null : gridA.finalPnl + (gridB.finalPnl ?? 0) };
+      }
+      function summarizeDual(paths) {
+        const completed = paths.filter(p => p.finalPnl !== null);
+        const pnls = completed.map(p => p.finalPnl).sort((a, b) => a - b);
+        const hours = completed.map(p => p.hours).sort((a, b) => a - b);
+        const mean = values => values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
+        const rate = outcome => paths.length ? paths.filter(p => p.outcome === outcome).length / paths.length : null;
+        return { topRate: rate("TOP"), bottomRate: rate("BOTTOM"), safetyRate: rate("SAFETY_LIMIT"),
+          meanPnl: mean(pnls), medianPnl: median(pnls), p5: pnls.length ? pnls[Math.floor(.05 * (pnls.length - 1))] : null,
+          p95: pnls.length ? pnls[Math.floor(.95 * (pnls.length - 1))] : null,
+          lossRate: completed.length ? completed.filter(p => p.finalPnl < 0).length / completed.length : null,
+          meanHours: mean(hours), medianHours: median(hours), avgTrades: mean(paths.map(p => p.trades)),
+          avgCompletedTrades: mean(completed.map(p => p.trades)) };
       }
       function buildHourlyCandles(path, params, startingIndex = CONSTANTS.PRICE_INDEX_START) {
         if (!path || !Array.isArray(path.hourlyHistory)) return [];
@@ -441,6 +552,11 @@
       function readParams() {
         const p = {};
         fields.forEach(([key]) => (p[key] = parseValue(key)));
+        p.gridB = { enabled: document.getElementById("enableGridB").checked,
+          relationship: document.getElementById("relationship").value,
+          startMode: document.getElementById("startMode").value,
+          trigger: parseValue("trigger"), rho: parseValue("rho") };
+        gridBFields.forEach(([key]) => p.gridB[key] = parseValue("b_" + key));
         return p;
       }
       function validate(p) {
@@ -474,6 +590,18 @@
           input.setAttribute("aria-invalid", !!errors[k]);
           err.textContent = errors[k] || "";
         });
+        const b = p.gridB;
+        if (b?.enabled) {
+          const invalid = gridBFields.filter(([key]) => !(b.relationship === "same" && ["annualVol", "annualDrift"].includes(key))).some(([key]) =>
+            !Number.isFinite(b[key]) || (["gridProfit", "topDist", "bottomDist", "observedCalendarDays"].includes(key) && b[key] <= 0)
+            || (["annualVol", "observedAvgTrades"].includes(key) && b[key] < 0));
+          const rate = tradeCalibration(b).tradeRatePerHour;
+          if (invalid || !Number.isFinite(rate) || rate > Number.MAX_SAFE_INTEGER / CONSTANTS.SAFETY_MAX_HOURS)
+            errors.gridB = "Enter finite Grid B values, positive distances, profit and duration, and nonnegative volatility and trades.";
+          if (b.startMode === "trigger" && !Number.isFinite(b.trigger)) errors.gridB = "Enter a finite trigger index.";
+          if (b.relationship === "different" && (!Number.isFinite(b.rho) || Math.abs(b.rho) > 1)) errors.gridB = "Correlation must be between -1 and +1.";
+        }
+        document.getElementById("gridBError").textContent = errors.gridB || "";
         document.getElementById("run").disabled = Object.keys(errors).length > 0;
         return errors;
       }
@@ -519,6 +647,8 @@
       }
       function renderSimulation(r, params) {
         const s = r.stats;
+        document.getElementById("gridLifetimeTitle").textContent = r.portfolios ? "Monte Carlo — Grid A Lifetime" : "Monte Carlo — Grid Lifetime";
+        document.getElementById("priceChartTitle").textContent = r.portfolios ? "Grid Prices, Activation and Boundaries" : "Price Index and Hourly Candles";
         document.getElementById("warning").className =
           "warning" + (s.safetyRate > 0 ? " show" : "");
         document.getElementById("warning").textContent =
@@ -544,7 +674,11 @@
         const staticResult = validStatic() ? computeStatic(readParams()) : null;
         document.getElementById("checkpoint").innerHTML =
           `<div><div class="row"><span>Delta approx. Top PoT</span><b>${staticResult ? fmt.pct(staticResult.topPoT) : "–"}</b></div><div class="row"><span>Delta approx. Bottom PoT</span><b>${staticResult ? fmt.pct(staticResult.bottomPoT) : "–"}</b></div></div><div><div class="row"><span>MC Top first-hit by 280 h</span><b>${fmt.pct(s.topMonth)}</b></div><div class="row"><span>MC Bottom first-hit by 280 h</span><b>${fmt.pct(s.bottomMonth)}</b></div><div class="row"><span>MC No boundary by 280 h</span><b>${fmt.pct(s.noMonth)}</b></div></div>`;
-        renderVisualization(r.visualizationPath, params);
+        if (r.portfolios) renderDual(r, params);
+        else {
+          document.getElementById("dualResults").hidden = true;
+          renderVisualization(r.visualizationPath, params);
+        }
       }
       function renderHistogram(h) {
         const notice = document.getElementById("chartNotice");
@@ -861,7 +995,107 @@
           document.getElementById("stale").classList.add("show");
         }
       }
+      const gridBFields = fields.filter(([key]) => !["topDelta", "bottomDelta", "seed"].includes(key));
+      let lastResult = null;
+      function updateDualControls() {
+        document.getElementById("gridBSettings").hidden = !document.getElementById("enableGridB").checked;
+        const same = document.getElementById("relationship").value === "same";
+        document.getElementById("rhoField").hidden = same;
+        document.getElementById("rho").disabled = same;
+        ["annualVol", "annualDrift"].forEach(key => {
+          document.getElementById("b_" + key).disabled = same;
+          document.getElementById("b_" + key).parentElement.hidden = same;
+        });
+        document.getElementById("triggerField").hidden = document.getElementById("startMode").value !== "trigger";
+      }
+      function renderDistribution() {
+        if (!lastResult) return;
+        const dual = !!lastResult.portfolios;
+        const selector = document.getElementById("distribution");
+        selector.hidden = !dual;
+        const choice = dual ? selector.value : "a";
+        document.getElementById("distributionTitle").textContent = dual
+          ? { a: "Grid A Final PnL Distribution", b: "Grid B Final PnL Distribution", combined: "Combined PnL Distribution" }[choice]
+          : "Final PnL Distribution";
+        const paths = choice === "a" ? lastResult.paths : choice === "b" ? lastResult.portfolios.map(p => p.gridB) : lastResult.portfolios;
+        renderHistogram(makeHistogram(paths.filter(p => p.finalPnl !== null).map(p => p.finalPnl), CONSTANTS.NUM_BINS));
+        if (choice === "b" && !lastResult.activationRate) document.getElementById("chartNotice").textContent = "N/A — no Grid B activations.";
+      }
+      function renderDual(r, params) {
+        const panel = document.getElementById("dualResults");
+        panel.hidden = false;
+        const warning = document.getElementById("warning");
+        warning.className = "warning" + (r.combinedStats.safetyRate > 0 ? " show" : "");
+        warning.textContent = r.combinedStats.safetyRate > 0
+          ? `${fmt.pct(r.combinedStats.safetyRate)} of portfolio paths reached the global safety limit. Their combined final PnL and completion durations are unavailable. Grid A statistics retain their original denominators.`
+          : "";
+        const value = (v, format = fmt.pnl) => v === null ? "N/A" : format(v);
+        const stats = (s, combined) => [
+          metric(combined ? "Mean Combined PnL" : "Mean Final PnL", value(s.meanPnl)),
+          metric(combined ? "Median Combined PnL" : "Median Final PnL", value(s.medianPnl)),
+          metric("P5 / P95", `${value(s.p5)} / ${value(s.p95)}`),
+          metric("Loss Rate", value(s.lossRate, fmt.pct)),
+          metric(combined ? "Mean Portfolio Duration" : "Mean Hours to Boundary", value(s.meanHours, fmt.time)),
+          metric(combined ? "Median Portfolio Duration" : "Median Hours to Boundary", value(s.medianHours, fmt.time)),
+          metric(combined ? "Avg Total Grid Trades (completed paths)" : "Avg Grid Trades (activated paths)", value(combined ? s.avgCompletedTrades : s.avgTrades)),
+          metric("Safety-Limit Rate", value(s.safetyRate, fmt.pct)),
+          ...(!combined ? [metric("Top Exit Rate", value(s.topRate, fmt.pct)), metric("Bottom Exit Rate", value(s.bottomRate, fmt.pct))] : []),
+        ].join("");
+        const notActivated = r.portfolios.filter(p => p.gridB.outcome === "NOT_ACTIVATED").length;
+        const pendingSafety = r.portfolios.filter(p => p.gridB.outcome === "NOT_ACTIVATED_SAFETY_LIMIT").length;
+        panel.innerHTML = `<h3>Grid B</h3><p class="note">Outcome rates and average trades use activated paths. PnL and boundary durations use completed activated paths.</p><div class="metrics">${metric("Activation Rate", fmt.pct(r.activationRate))}${metric("Not Activated (paths)", String(notActivated))}${metric("Not Activated — Safety Limit (paths)", String(pendingSafety))}${stats(r.gridBStats, false)}</div><h3>Combined Portfolio</h3><p class="note">Overall safety-limit paths are excluded from combined PnL and completion durations. Grid A statistics above retain their original population.</p><div class="metrics">${stats(r.combinedStats, true)}</div>`;
+        renderDualVisualization(r.portfolioVisualization, params);
+      }
+      function renderDualVisualization(path, params) {
+        if (!path) { renderEmptyVisualization(); return; }
+        destroyVisualizationCharts();
+        document.getElementById("visualizationLayout").hidden = false;
+        const a = path.gridA, b = path.gridB;
+        document.getElementById("visualizationNotice").textContent = "One completed portfolio path. Both charts use global hours; strategy lines end at termination. Shared market endpoints can overshoot strategy boundaries.";
+        document.getElementById("pathSummary").innerHTML = [
+          metric("Grid A exit / duration", `${a.outcome} / ${a.hours} h`),
+          metric("Grid A trades / final PnL", `${a.trades} / ${fmt.pnl(a.finalPnl)}`),
+          metric("Grid B", b.outcome === "NOT_ACTIVATED" ? "Not Activated" : b.outcome),
+          ...(b.activationHour !== null ? [metric("B activation hour / price", `${b.activationHour} / ${b.startPrice.toFixed(2)}`),
+            metric("B local duration / trades", `${b.hours} h / ${b.trades}`), metric("B final PnL", fmt.pnl(b.finalPnl))] : []),
+          metric("Portfolio duration / total trades", `${path.hours} h / ${path.trades}`), metric("Combined Final PnL", fmt.pnl(path.finalPnl)),
+        ].join("");
+        if (!window.Chart) {
+          document.getElementById("visualizationCharts").style.display = "none";
+          document.getElementById("visualizationNotice").textContent += " Chart.js unavailable; path summary remains available.";
+          return;
+        }
+        document.getElementById("visualizationCharts").style.display = "";
+        const line = (label, data, color, extra = {}) => ({ label, data, borderColor: color, backgroundColor: color, pointRadius: 0, borderWidth: 1.5, ...extra });
+        const bounds = (name, low, high, start, end, color) => [low, high].map((y, i) => line(`${name} ${i ? "upper" : "lower"}`, [{ x: start, y }, { x: end, y }], color, { borderDash: [5, 5] }));
+        const aData = a.hourlyHistory.map(p => ({ x: p.hour, y: 100 + p.displacement }));
+        const datasets = [line("Grid A market price (active strategy)", aData, "#1769aa"), ...bounds("A", 100 - params.bottomDist, 100 + params.topDist, 0, a.hours, "#1769aa"),
+          line("A termination", [{ x: a.hours, y: a.outcome === "TOP" ? 100 + params.topDist : 100 - params.bottomDist }], "#1769aa", { pointRadius: 6 })];
+        if (params.gridB.startMode === "trigger") datasets.push(line("B trigger on A", [{ x: 0, y: params.gridB.trigger }, { x: a.hours, y: params.gridB.trigger }], "#b7791f", { borderDash: [2, 3] }));
+        if (b.activationHour !== null) {
+          datasets.push(line(params.gridB.relationship === "same" ? "Shared market price (Grid B active)" : "Grid B market price", b.hourlyHistory.map(p => ({ x: p.hour, y: p.price })), "#027a48"),
+            ...bounds("B", b.lower, b.upper, b.activationHour, b.activationHour + b.hours, "#027a48"),
+            line("B activation", [{ x: b.activationHour, y: b.startPrice }], "#b7791f", { pointRadius: 6 }),
+            line("B termination", [{ x: b.activationHour + b.hours, y: b.outcome === "TOP" ? b.upper : b.lower }], "#027a48", { pointRadius: 6 }));
+        }
+        const options = { animation: false, parsing: false, scales: { x: { type: "linear", min: 0, max: path.hours, title: { display: true, text: "Global hour" } }, y: { title: { display: true, text: "Price index" } } } };
+        priceChart = new Chart(document.getElementById("priceChart"), { type: "line", data: { datasets }, options });
+        activityChart = new Chart(document.getElementById("activityChart"), { type: "bar", data: { datasets: [
+          line("A completed cycles", a.hourlyHistory.slice(1).map(p => ({ x: p.hour, y: p.completedCycles })), "#1769aa"),
+          line("B completed cycles", b.hourlyHistory.slice(1).map(p => ({ x: p.hour, y: p.completedCycles })), "#027a48"),
+        ] }, options: { ...options, scales: { ...options.scales, y: { beginAtZero: true, title: { display: true, text: "Completed cycles" } } } } });
+      }
       buildInputs();
+      gridBFields.forEach(([key, label]) => {
+        const wrap = document.createElement("div");
+        wrap.innerHTML = `<label for="b_${key}">${label}</label><input id="b_${key}" inputmode="decimal" value="${DEFAULTS[key]}">`;
+        document.getElementById("gridBInputs").append(wrap);
+      });
+      ["enableGridB", "relationship", "startMode", "trigger", "rho", ...gridBFields.map(([k]) => "b_" + k)].forEach(id => {
+        document.getElementById(id).addEventListener("input", () => { updateDualControls(); refresh(); markStale(id); });
+      });
+      document.getElementById("distribution").addEventListener("change", renderDistribution);
+      updateDualControls();
       fields.forEach(([key]) =>
         document.getElementById(key).addEventListener("input", () => {
           refresh();
@@ -869,6 +1103,19 @@
         }),
       );
       document.getElementById("reset").addEventListener("click", () => {
+        document.getElementById("enableGridB").checked = false;
+        document.getElementById("relationship").value = "same";
+        document.getElementById("startMode").value = "immediate";
+        document.getElementById("trigger").value = "105";
+        document.getElementById("rho").value = "0";
+        gridBFields.forEach(([k]) => document.getElementById("b_" + k).value = DEFAULTS[k]);
+        updateDualControls();
+        lastResult = null;
+        document.getElementById("dualResults").hidden = true;
+        document.getElementById("distribution").hidden = true;
+        document.getElementById("distributionTitle").textContent = "Final PnL Distribution";
+        document.getElementById("gridLifetimeTitle").textContent = "Monte Carlo — Grid Lifetime";
+        document.getElementById("priceChartTitle").textContent = "Price Index and Hourly Candles";
         fields.forEach(([k]) => (document.getElementById(k).value = DEFAULTS[k]));
         hasRun = false;
         stale = false;
@@ -894,12 +1141,9 @@
           const seed = p.seed === "" ? (Math.random() * 4294967296) >>> 0 : p.seed >>> 0,
             result = runSimulation(p, createRng(seed));
           renderSimulation(result, p);
-          renderHistogram(
-            makeHistogram(
-              result.paths.filter((x) => x.finalPnl !== null).map((x) => x.finalPnl),
-              CONSTANTS.NUM_BINS,
-            ),
-          );
+          lastResult = result;
+          document.getElementById("distribution").value = "combined";
+          renderDistribution();
           hasRun = true;
           stale = false;
           document.getElementById("stale").classList.remove("show");
@@ -916,6 +1160,8 @@
         computeStatic,
         createRng,
         simulatePath,
+        simulateGridB,
+        summarizeDual,
         runSimulation,
         buildHourlyCandles,
         makeHistogram,
